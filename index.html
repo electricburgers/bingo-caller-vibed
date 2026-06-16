@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#15171c">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Bingo Caller v2.0</title>
+<title>Bingo Caller</title>
 <style>
   /* ============================================================
      THEME TOKENS (overridable per theme / custom builder)
@@ -111,6 +111,19 @@
   .callmeta{display:flex;gap:14px;justify-content:center;font-size:.82rem;color:var(--muted);margin-top:2px}
   .callmeta b{color:var(--text)}
   .drawscope{text-align:center;font-size:.74rem;color:var(--muted);margin-top:3px;min-height:14px;font-weight:600}
+
+  /* preview panel */
+  .preview-panel{background:var(--surface-2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-top:10px}
+  .preview-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;gap:8px}
+  .preview-label{font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);display:flex;align-items:center;gap:7px}
+  .preview-host-tag{font-size:.65rem;background:rgba(255,210,63,.15);color:var(--accent);border:1px solid rgba(255,210,63,.3);border-radius:5px;padding:1px 5px;font-weight:700;letter-spacing:.04em}
+  .preview-body{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .preview-ball-mini{font-weight:900;font-size:1.45rem;display:flex;align-items:baseline;gap:4px;min-width:56px}
+  .preview-ball-mini #previewLetter{font-size:1rem;font-weight:900;color:var(--preview-col,var(--muted))}
+  .preview-ball-mini #previewNum{color:var(--preview-col,var(--muted))}
+  .preview-callout-txt{font-size:.85rem;font-weight:700;color:var(--muted);font-style:italic;flex:1;min-width:120px;line-height:1.3}
+  .preview-panel.empty .preview-body{opacity:.4}
+  .preview-panel.hidden{display:none}
   .callout{min-height:22px;text-align:center;font-weight:800;font-size:1.02rem;color:var(--accent);padding:0 6px;line-height:1.2}
   .callout-row{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:8px;min-height:22px}
   .callout-row:has(.callout:empty) .cyclebtn{display:none}
@@ -351,6 +364,20 @@
         </div>
 
         <div class="recent" id="recent"><span class="muted">Recent calls appear here…</span></div>
+
+        <!-- live preview panel -->
+        <div class="preview-panel" id="previewPanel">
+          <div class="preview-top">
+            <span class="preview-label">⏭ Next up <span class="preview-host-tag">host only</span></span>
+            <button class="btn" id="redrawBtn" style="flex:0 0 auto;font-size:.78rem;padding:4px 10px;min-height:32px">↻ Redraw</button>
+          </div>
+          <div class="preview-body">
+            <div class="preview-ball-mini" id="previewBallMini">
+              <span id="previewLetter"></span><span id="previewNum">—</span>
+            </div>
+            <span class="preview-callout-txt" id="previewCalloutTxt"></span>
+          </div>
+        </div>
       </div>
 
       <!-- pattern -->
@@ -401,6 +428,7 @@
       <div class="card">
         <h2>Audit &amp; log
           <span style="display:flex;gap:6px">
+            <button class="iconbtn" id="reportBtn" title="Night report" style="min-height:36px;padding:6px 9px">📋 Report</button>
             <button class="iconbtn" id="saveJsonBtn" title="Save session(s) to JSON" style="min-height:36px;padding:6px 9px">💾 JSON</button>
             <button class="iconbtn" id="exportBtn" title="Export CSV/TXT" style="min-height:36px;padding:6px 9px">⤓ Export</button>
           </span>
@@ -500,6 +528,8 @@
     </div>
     <div class="sect">
       <h3>Calling</h3>
+      <div class="toggle"><span>Show next-ball preview (host only)</span>
+        <label class="switch"><input type="checkbox" id="previewChk" checked><span class="slider"></span></label></div>
       <div class="toggle"><span>Only draw balls the pattern can use</span>
         <label class="switch"><input type="checkbox" id="limitChk" checked><span class="slider"></span></label></div>
       <p class="pat-cap" style="margin:-2px 0 4px">e.g. Four Corners skips the I, N and G columns. Switching pattern keeps every called ball, and re-opens any columns the new pattern needs.</p>
@@ -709,6 +739,7 @@ function defaultState(){
       limitDraw:true,
       autoInterval:10,
       patCollapsed:false,
+      showPreview:true,
     },
     customPatterns:[],
     customThemes:[],
@@ -929,6 +960,7 @@ function selectPattern(key){
   S.pattern=key; _probCache.key=''; save();
   $('#customEditor').classList.toggle('hide', !key.startsWith('custom:'));
   buildPatternTiles(); renderPattern(); renderBall(false); renderProbBar();
+  _nextBall=null; pickNextBall(); renderPreview();
 }
 
 function renderPattern(){
@@ -962,20 +994,34 @@ function buildEditor(){
   }
 }
 
-/* ---------- Win probability (Monte Carlo) ---------- */
-let _probCache = {key:'', pSingle:0, pAny:0};
+/* ---------- Win probability ----------
+   Fixed-cell patterns  →  exact analytic formula, handles tiny probabilities correctly.
+   Meta patterns (any / col / row)  →  Monte Carlo (large-enough win rates per trial).
+
+   Analytic formula per column c with k_c required rows and N_c called balls:
+     P(all k_c required rows covered) = C(N_c, k_c) / C(15, k_c)
+   Columns use disjoint number ranges → multiply independently.
+------------------------------------------------------------------------------ */
+
+function comb(n,k){
+  if(k<0||k>n) return 0;
+  if(k===0||k===n) return 1;
+  if(k>n-k) k=n-k;
+  let r=1; for(let i=0;i<k;i++) r=r*(n-i)/(i+1);
+  return Math.round(r);
+}
 
 function generateCard(){
   const card=[];
   for(let c=0;c<5;c++){
     const pool=[];for(let i=c*15+1;i<=c*15+15;i++)pool.push(i);
     for(let i=pool.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[pool[i],pool[j]]=[pool[j],pool[i]];}
-    card.push(pool.slice(0,5)); // card[col][row 0..4]
+    card.push(pool.slice(0,5));
   }
   return card;
 }
 
-function cardWinsPattern(card, calledSet, p){
+function cardWinsPattern(card,calledSet,p){
   const hit=(r,c)=>(S.freeSpace&&r===2&&c===2)||calledSet.has(card[c][r]);
   if(p.meta==='any'){
     for(let r=0;r<5;r++)if([0,1,2,3,4].every(c=>hit(r,c)))return true;
@@ -986,24 +1032,55 @@ function cardWinsPattern(card, calledSet, p){
   }
   if(p.meta==='col'){for(let c=0;c<5;c++)if([0,1,2,3,4].every(r=>hit(r,c)))return true;return false;}
   if(p.meta==='row'){for(let r=0;r<5;r++)if([0,1,2,3,4].every(c=>hit(r,c)))return true;return false;}
-  const cells=p.cells||[];
-  return cells.every(([r,c])=>hit(r,c));
+  return(p.cells||[]).every(([r,c])=>hit(r,c));
 }
 
-function estimateWinProbability(numCards){
-  if(!S.called.length)return{pSingle:0,pAny:0};
-  const pat=currentPatternDef();
-  const key=JSON.stringify(S.called)+pat.name+(S.freeSpace?'1':'0');
-  if(_probCache.key===key){
-    const pAny=1-Math.pow(1-_probCache.pSingle,numCards);
-    return{pSingle:_probCache.pSingle, pAny};
+function analyticalSingleProb(patDef,calledSet){
+  const kc=[0,0,0,0,0];
+  for(const [r,c] of (patDef.cells||[])){
+    if(S.freeSpace&&r===2&&c===2) continue;
+    kc[c]++;
   }
+  let p=1;
+  for(let col=0;col<5;col++){
+    if(!kc[col]) continue;
+    const start=col*15+1;
+    let Nc=0; for(let n=start;n<start+15;n++) if(calledSet.has(n)) Nc++;
+    const pc=comb(Nc,kc[col])/comb(15,kc[col]);
+    if(!pc) return 0;
+    p*=pc;
+  }
+  return p;
+}
+
+let _probCache={key:'',pSingle:0};
+
+function estimateWinProbability(numCards){
+  if(!S.called.length) return{pSingle:0,pAny:0};
+  const pat=currentPatternDef();
   const calledSet=new Set(S.called);
-  const TRIALS=3000; let wins=0;
-  for(let t=0;t<TRIALS;t++) if(cardWinsPattern(generateCard(),calledSet,pat))wins++;
-  const pSingle=wins/TRIALS;
-  _probCache={key, pSingle};
-  return{pSingle, pAny:1-Math.pow(1-pSingle,numCards)};
+  const fk=S.freeSpace?'1':'0';
+  let pSingle;
+
+  if(pat.cells&&!pat.meta){
+    // Exact analytic — works for all fixed-cell patterns regardless of probability size
+    const perCol=[0,1,2,3,4].map(c=>{let n=0;for(let b=c*15+1;b<=c*15+15;b++)if(calledSet.has(b))n++;return n;});
+    const key=S.called.length+'|'+pat.name+'|'+fk+'|'+perCol.join(',');
+    if(_probCache.key===key){ pSingle=_probCache.pSingle; }
+    else{ pSingle=analyticalSingleProb(pat,calledSet); _probCache={key,pSingle}; }
+  } else {
+    // Monte Carlo for meta-patterns (any-line etc.)
+    const key=S.called.slice(-30).join(',')+pat.name+fk;
+    if(_probCache.key===key){ pSingle=_probCache.pSingle; }
+    else{
+      const TRIALS=4000; let wins=0;
+      for(let t=0;t<TRIALS;t++) if(cardWinsPattern(generateCard(),calledSet,pat)) wins++;
+      pSingle=wins/TRIALS; _probCache={key,pSingle};
+    }
+  }
+
+  const pAny=1-Math.pow(Math.max(0,1-pSingle),numCards);
+  return{pSingle,pAny};
 }
 
 function renderProbBar(){
@@ -1014,21 +1091,41 @@ function renderProbBar(){
     return;
   }
   const {pSingle,pAny}=estimateWinProbability(numCards);
-  const pct=n=>n<.01&&n>0?'<1%':n>.999?'>99%':(n*100).toFixed(1)+'%';
-  $('#probFill').style.width=(pAny*100).toFixed(1)+'%';
+  const pct=n=>{
+    if(!n||isNaN(n)) return '0%';
+    if(n<0.00001)  return '<0.001%';
+    if(n<0.001)    return (n*100).toFixed(3)+'%';
+    if(n<0.01)     return (n*100).toFixed(2)+'%';
+    if(n>0.99999)  return '>99.999%';
+    return (n*100).toFixed(1)+'%';
+  };
+  $('#probFill').style.width=(Math.min(1,pAny)*100).toFixed(3)+'%';
   $('#probNums').innerHTML=
     `Any of <b>${numCards}</b> cards wins: <b>${pct(pAny)}</b> &nbsp;·&nbsp; Single card: ${pct(pSingle)}`;
 }
+
 
 /* ---------- audit / log ---------- */
 function fmtTime(iso){const d=new Date(iso);return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});}
 function renderLog(){
   const body=$('#logBody');
-  // newest first
+  // Build a map of callCount → winner records for that call index
+  const winAtCall={};
+  S.winners.forEach(w=>{ (winAtCall[w.callCount]=winAtCall[w.callCount]||[]).push(w); });
+
+  // Interleave winner rows into the call log (newest first)
   const rows=[];
   S.called.forEach((n,i)=>{
+    const callNum=i+1;
     const lt=letterFor(n);
-    rows.push(`<tr><td>${i+1}</td><td><b style="color:${lt?`var(--col-${lt})`:'inherit'}">${lt} ${n}</b></td><td class="mono">${S.callTimes?fmtTime(S.callTimes[i]):''}</td></tr>`);
+    rows.push(`<tr><td>${callNum}</td><td><b style="color:${lt?`var(--col-${lt})`:'inherit'}">${lt}\u00a0${n}</b></td><td class="mono">${S.callTimes?fmtTime(S.callTimes[i]):''}</td></tr>`);
+    // Insert winner row(s) AFTER the ball that triggered the win
+    if(winAtCall[callNum]){
+      winAtCall[callNum].forEach(w=>{
+        const label=w.name ? `<b class="winner-name">${w.name}</b> · ${w.pattern}` : `<b>${w.pattern}</b>`;
+        rows.push(`<tr class="win"><td>🏆</td><td colspan="2">${label} · <span class="mono">${fmtTime(w.ts)}</span></td></tr>`);
+      });
+    }
   });
   body.innerHTML=rows.reverse().join('')||'<tr><td colspan="3" class="muted" style="padding:14px">No balls called yet.</td></tr>';
 
@@ -1038,16 +1135,14 @@ function renderLog(){
   $('#sGames').textContent=S.session.games;
   renderProbBar();
 
-  // winners
-  const nightNames = S.winners.filter(w=>w.name).map(w=>w.name);
-  if(nightNames.length){
-    $('#winList').innerHTML = '<div class="congrats-banner">🎉 Tonight\'s winners: <b>'+nightNames.join(', ')+'</b></div>'
-    + S.winners.map(w=>`<div class="winrec">🏆 ${w.name?`<b class="winner-name">${w.name}</b> · `:''}${w.pattern} · call #${w.callCount} · <span class="mono">${fmtTime(w.ts)}</span></div>`).join('');
-  } else {
-    $('#winList').innerHTML=S.winners.map(w=>
-      `<div class="winrec">🏆 <b>${w.pattern}</b> · call #${w.callCount} · <span class="mono">${fmtTime(w.ts)}</span></div>`
-    ).join('');
-  }
+  // Winners panel — always same format: name (if any) · pattern · call # · time
+  const allNames=S.winners.filter(w=>w.name).map(w=>w.name);
+  const banner=allNames.length
+    ? `<div class="congrats-banner">🎉 Tonight's winners: <b>${allNames.join(', ')}</b></div>` : '';
+  $('#winList').innerHTML=banner+S.winners.map(w=>{
+    const who=w.name?`<b class="winner-name">${w.name}</b> · `:''
+    return `<div class="winrec">🏆 ${who}${w.pattern} · call #${w.callCount} · <span class="mono">${fmtTime(w.ts)}</span></div>`;
+  }).join('');
 
   // history
   $('#historyList').innerHTML = S.history.length
@@ -1063,6 +1158,46 @@ function renderLog(){
    ========================================================================== */
 function ensureTimes(){ if(!S.callTimes) S.callTimes=[]; }
 
+/* ---------- Live call-out preview ---------- */
+let _nextBall = null; // pre-selected ball — host-only, not persisted
+
+function pickNextBall(){
+  const elig = eligibleBalls();
+  if(!elig.length){ _nextBall = null; return; }
+  // Try to pick something other than whatever was just called
+  const last = S.called[S.called.length-1];
+  const pool = elig.length > 1 ? elig.filter(n=>n!==last) : elig;
+  _nextBall = pool[Math.floor(Math.random()*pool.length)];
+}
+
+function renderPreview(){
+  const panel = $('#previewPanel');
+  if(!S.settings.showPreview){ panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+
+  if(!_nextBall || !eligibleBalls().includes(_nextBall)){
+    pickNextBall();
+  }
+
+  if(!_nextBall){
+    panel.classList.add('empty');
+    $('#previewLetter').textContent = '';
+    $('#previewNum').textContent = '—';
+    $('#previewCalloutTxt').textContent = 'No more balls to call';
+    panel.style.removeProperty('--preview-col');
+    return;
+  }
+  panel.classList.remove('empty');
+  const lt = letterFor(_nextBall);
+  const variants = callVariants(_nextBall);
+  const idx = S.calloutIdx[_nextBall] || 0;
+  const co = S.settings.callouts && variants.length ? variants[idx % variants.length] : '';
+  $('#previewLetter').textContent = lt;
+  $('#previewNum').textContent = _nextBall;
+  $('#previewCalloutTxt').textContent = co || '';
+  panel.style.setProperty('--preview-col', `var(--col-${lt})`);
+}
+
 function callNext(){
   const elig=eligibleBalls();
   if(!elig.length){
@@ -1070,12 +1205,15 @@ function callNext(){
     stopAuto(); return;
   }
   ensureTimes();
-  const n=elig[Math.floor(Math.random()*elig.length)];
+  // Use pre-selected preview ball if still valid; otherwise random
+  const n = (_nextBall && elig.includes(_nextBall)) ? _nextBall : elig[Math.floor(Math.random()*elig.length)];
+  _nextBall = null; // clear before picking next
   S.called.push(n);
   S.callTimes.push(new Date().toISOString());
   save();
   renderBall(true); renderRecent(); paintBoard(); renderLog();
   if(S.settings.haptics && navigator.vibrate) navigator.vibrate(35);
+  pickNextBall(); renderPreview(); // advance preview to the following ball
   if(!eligibleBalls().length){ toast('Last ball in play for this pattern.'); stopAuto(); }
 }
 
@@ -1085,6 +1223,7 @@ function undo(){
   S.called.pop(); S.callTimes.pop();
   save();
   renderBall(false); renderRecent(); paintBoard(); renderLog();
+  _nextBall=null; pickNextBall(); renderPreview();
 }
 
 function newGame(){
@@ -1100,8 +1239,8 @@ function markWinner(){
   confirmModal(
     '🏆 Mark winner!',
     'Pattern: '+p.name+' · call #'+S.called.length,
-    ()=>{
-      const name=($('#modalNameInput')?$('#modalNameInput').value.trim():'');
+    (captured)=>{
+      const name=((captured&&captured.modalNameInput)||'').trim();
       S.winners.push({
         name, pattern:p.name, ts:new Date().toISOString(),
         callCount:S.called.length, lastBall:S.called[S.called.length-1]
@@ -1326,6 +1465,7 @@ function fullRender(){
   $('#intRange').value=S.settings.autoInterval||10;
   $('#intLabel').textContent=S.settings.autoInterval||10;
   renderBall(false); renderRecent(); renderPattern(); paintBoard(); renderLog();
+  _nextBall=null; pickNextBall(); renderPreview();
 }
 
 function applyPatCollapsed(){
@@ -1339,6 +1479,7 @@ function init(){
   if(!S.settings.autoInterval) S.settings.autoInterval=10;
   if(S.settings.callouts===undefined) S.settings.callouts=true;
   if(S.settings.limitDraw===undefined) S.settings.limitDraw=true;
+  if(S.settings.showPreview===undefined) S.settings.showPreview=true;
   if(S.settings.patCollapsed===undefined) S.settings.patCollapsed=false;
   if(!S.calloutIdx) S.calloutIdx={};
   applyTheme();
@@ -1346,12 +1487,13 @@ function init(){
   buildPatternTiles();
   buildThemeRow(); buildSwatches();
   buildEditor();
-  fullRender();
+  fullRender(); // fullRender now calls pickNextBall + renderPreview internally
 
   // settings reflect
   $('#fontRange').value=S.settings.fontScale; $('#fsLabel').textContent=S.settings.fontScale+'%';
   $('#freeChk').checked=S.freeSpace;
   $('#limitChk').checked=S.settings.limitDraw;
+  $('#previewChk').checked=S.settings.showPreview;
   $('#hapticChk').checked=S.settings.haptics;
   $('#calloutChk').checked=S.settings.callouts;
   $('#intRange').value=S.settings.autoInterval; $('#intLabel').textContent=S.settings.autoInterval;
@@ -1364,7 +1506,10 @@ function init(){
 
   $('#calloutChk').onchange=e=>{ S.settings.callouts=e.target.checked; save(); renderBall(false); };
   $('#cycleBtn').onclick=cycleCallout;
-  $('#limitChk').onchange=e=>{ S.settings.limitDraw=e.target.checked; save(); renderBall(false); paintBoard(); };
+  $('#redrawBtn').onclick=()=>{ _nextBall=null; pickNextBall(); renderPreview(); };
+  $('#reportBtn').onclick=generateNightReport;
+  $('#limitChk').onchange=e=>{ S.settings.limitDraw=e.target.checked; save(); renderBall(false); paintBoard(); _nextBall=null; pickNextBall(); renderPreview(); };
+  $('#previewChk').onchange=e=>{ S.settings.showPreview=e.target.checked; save(); renderPreview(); };
 
   /* core buttons */
   $('#callBtn').onclick=callNext;
@@ -1423,10 +1568,14 @@ function init(){
     $('#themeName').value=''; save(); buildThemeRow(); toast('Saved theme: '+name);
   };
 
-  /* modal */
-  $('#modalOk').onclick=()=>{ const f=modalOk; closeModal(); if(f)f(); };
+  /* modal — capture extra inputs BEFORE closeModal wipes #modalExtra */
+  $('#modalOk').onclick=()=>{
+    const captured={};
+    $$('#modalExtra input,#modalExtra textarea,#modalExtra select').forEach(el=>{captured[el.id]=el.value;});
+    const f=modalOk; closeModal(); if(f)f(captured);
+  };
   $('#modalCancel').onclick=()=>{ const f=modalCancelFn; closeModal(); if(f)f(); };
-  // Enter key submits in winner-name input
+  // Enter submits; Escape cancels
   $('#modal').addEventListener('keydown',e=>{
     if(e.key==='Enter'&&document.activeElement.tagName==='INPUT'){ e.preventDefault(); $('#modalOk').click(); }
     if(e.key==='Escape'){ e.preventDefault(); const f=modalCancelFn; closeModal(); if(f)f(); }
@@ -1452,6 +1601,169 @@ function init(){
 /* ==========================================================================
    PWA — inline manifest + best-effort service worker
    ========================================================================== */
+/* ==========================================================================
+   NIGHT REPORT — generates a self-contained printable/shareable HTML page
+   ========================================================================== */
+function generateNightReport(){
+  // Collect all games: archived + current (if anything happened)
+  const games = S.history.map((h,i)=>({...h, gameNum:i+1, isCurrent:false}));
+  if(S.called.length || S.winners.length){
+    games.push({
+      gameNum: games.length+1, isCurrent:true,
+      ended: new Date().toISOString(),
+      calls: S.called.length, winners: S.winners.length,
+      pattern: currentPatternDef().name,
+      order: S.called.slice(),
+      times: (S.callTimes||[]).slice(),
+      winnerRecs: S.winners.slice(),
+    });
+  }
+  if(!games.length){ toast('No games yet — call some balls first!'); return; }
+
+  const nightDate = new Date(S.session.started).toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  const lcol = {B:'#ff595e',I:'#ff924c',N:'#ffca3a',G:'#8ac926',O:'#52a6f0'};
+
+  // Build the visual board for a game
+  function boardHTML(calledSet){
+    let h='<div class="r-board">';
+    ['B','I','N','G','O'].forEach((L,c)=>{
+      h+=`<div class="r-col"><div class="r-head" style="color:${lcol[L]};border-bottom:3px solid ${lcol[L]}">${L}</div>`;
+      for(let r=0;r<15;r++){
+        const n=c*15+r+1;
+        const on=calledSet.has(n);
+        h+=`<div class="r-cell${on?' r-called':''}" style="${on?`background:${lcol[L]}20;color:${lcol[L]};border:1px solid ${lcol[L]}40;font-weight:800`:''}">${n}</div>`;
+      }
+      h+='</div>';
+    });
+    return h+'</div>';
+  }
+
+  // Build a game section
+  function gameSection(g){
+    const calledSet=new Set(g.order||[]);
+    const winnerRows=(g.winnerRecs||[]).map(w=>{
+      const who=w.name?`<strong style="color:#22c55e">${w.name}</strong> — `:'';
+      return `<div class="r-winner">🏆 ${who}${w.pattern} · call #${w.callCount} · ${fmtTime(w.ts)}</div>`;
+    }).join('');
+    const callRows=(g.order||[]).map((n,i)=>{
+      const lt=letterFor(n);
+      const t=g.times&&g.times[i]?fmtTime(g.times[i]):'';
+      const wins=(g.winnerRecs||[]).filter(w=>w.callCount===i+1);
+      const winTag=wins.map(w=>`<span class="r-win-tag">🏆${w.name?' '+w.name:''}</span>`).join('');
+      return `<tr><td>${i+1}</td><td style="color:${lcol[lt]||'inherit'};font-weight:800">${lt} ${n}</td><td>${t}</td><td>${winTag}</td></tr>`;
+    }).join('');
+    return `
+    <section class="r-game">
+      <div class="r-game-head">
+        <h2>Game ${g.gameNum}${g.isCurrent?' <span class="r-live">in progress</span>':''}</h2>
+        <span class="r-game-meta">${g.pattern} · ${g.calls} ball${g.calls!==1?'s':''} · ended ${fmtTime(g.ended)}</span>
+      </div>
+      ${winnerRows||'<p class="r-nowin">No winners recorded for this round.</p>'}
+      ${boardHTML(calledSet)}
+      <details>
+        <summary>Full call log (${g.calls} balls)</summary>
+        <table class="r-log">
+          <thead><tr><th>#</th><th>Ball</th><th>Time</th><th></th></tr></thead>
+          <tbody>${callRows||'<tr><td colspan="4" style="color:#888">No calls yet</td></tr>'}</tbody>
+        </table>
+      </details>
+    </section>`;
+  }
+
+  // Collect all winner names across the night
+  const allWinners=[...S.history,...(S.called.length||S.winners.length?[{winnerRecs:S.winners}]:[])]
+    .flatMap(g=>(g.winnerRecs||[]).filter(w=>w.name).map(w=>w.name));
+  const nightBanner = allWinners.length
+    ? `<div class="r-banner">🎉 Tonight's winners: <strong>${[...new Set(allWinners)].join(', ')}</strong></div>` : '';
+
+  const html=`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bingo Night Report — ${nightDate}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#f5f7fb;color:#1a2332;font-size:15px;line-height:1.5;padding:0 0 40px}
+.r-wrap{max-width:900px;margin:0 auto;padding:24px 20px}
+.r-header{text-align:center;padding:28px 0 22px;border-bottom:2px solid #e2e8f0;margin-bottom:28px}
+.r-header h1{font-size:2rem;font-weight:900;letter-spacing:-.02em;color:#0f172a}
+.r-header .r-date{color:#64748b;font-size:1rem;margin-top:4px}
+.r-header .r-sessions{margin-top:10px;font-size:.85rem;color:#94a3b8;font-weight:600}
+.r-banner{background:#dcfce7;border:1px solid #86efac;border-radius:10px;padding:12px 16px;font-size:1rem;margin-bottom:24px;color:#15803d}
+.r-game{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;margin-bottom:22px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+.r-game-head{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.r-game-head h2{font-size:1.15rem;font-weight:900;color:#0f172a}
+.r-live{font-size:.75rem;background:#fef3c7;color:#d97706;border-radius:5px;padding:2px 6px;font-weight:700}
+.r-game-meta{font-size:.82rem;color:#64748b;font-weight:600}
+.r-winner{background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:9px 12px;margin-bottom:8px;font-size:.92rem}
+.r-nowin{color:#94a3b8;font-size:.88rem;font-style:italic;margin-bottom:10px}
+.r-win-tag{background:#fef3c7;color:#92400e;border-radius:4px;padding:1px 5px;font-size:.75rem;font-weight:700;margin-left:4px}
+/* board */
+.r-board{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin:14px 0}
+.r-col{display:flex;flex-direction:column;gap:3px}
+.r-head{text-align:center;font-weight:900;font-size:1rem;padding:5px 0;border-radius:6px 6px 0 0;background:#f8fafc}
+.r-cell{text-align:center;font-size:.78rem;padding:4px 2px;border-radius:5px;border:1px solid #e2e8f0;background:#f8fafc;color:#94a3b8;font-variant-numeric:tabular-nums}
+.r-called{font-weight:900}
+/* call log */
+details{margin-top:14px}
+summary{cursor:pointer;font-size:.85rem;font-weight:700;color:#64748b;padding:4px 0;user-select:none}
+.r-log{width:100%;border-collapse:collapse;font-size:.83rem;margin-top:8px}
+.r-log th{background:#f1f5f9;padding:6px 8px;text-align:left;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:#64748b}
+.r-log td{padding:5px 8px;border-top:1px solid #f1f5f9;font-variant-numeric:tabular-nums;color:#475569}
+.r-log tr:nth-child(even) td{background:#fafafa}
+/* print toolbar */
+.r-toolbar{position:sticky;top:0;z-index:10;background:rgba(245,247,251,.94);backdrop-filter:blur(8px);border-bottom:1px solid #e2e8f0;padding:10px 20px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.r-toolbar button{border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:7px 14px;font-size:.88rem;font-weight:700;cursor:pointer;color:#0f172a}
+.r-toolbar button:hover{background:#f1f5f9}
+.r-toolbar button.primary{background:#0f172a;color:#fff;border-color:#0f172a}
+.r-meta-bar{text-align:center;color:#94a3b8;font-size:.78rem;margin-top:28px;padding-top:16px;border-top:1px solid #e2e8f0}
+@media print{
+  .r-toolbar{display:none!important}
+  body{background:#fff;padding:0}
+  .r-game{break-inside:avoid;box-shadow:none;border:1px solid #ddd}
+  details{display:block}
+  details summary{display:none}
+  .r-log{display:table}
+}
+</style>
+</head>
+<body>
+<div class="r-toolbar">
+  <button class="primary" onclick="window.print()">🖨 Print</button>
+  <button onclick="dlReport()">⬇ Download HTML</button>
+  <span style="flex:1;font-size:.82rem;color:#64748b">${nightDate} · ${games.length} game(s)</span>
+  <button onclick="window.close()">✕ Close</button>
+</div>
+<div class="r-wrap">
+  <div class="r-header">
+    <h1>🎱 Bingo Night Report</h1>
+    <div class="r-date">${nightDate}</div>
+    <div class="r-sessions">${games.length} game(s) · ${games.reduce((a,g)=>a+g.calls,0)} total balls called · Generated ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>
+  </div>
+  ${nightBanner}
+  ${games.map(gameSection).join('\n')}
+  <div class="r-meta-bar">Generated by Bingo Caller &nbsp;·&nbsp; Revolution Entertainment &nbsp;·&nbsp; ${new Date().toLocaleString()}</div>
+</div>
+<script>
+function dlReport(){
+  const a=document.createElement('a');
+  a.href='data:text/html;charset=utf-8,'+encodeURIComponent('<!DOCTYPE html>'+document.documentElement.outerHTML);
+  a.download='bingo-night-${stamp()}.html';
+  a.click();
+}
+<\/script>
+</body>
+</html>`;
+
+  try{
+    const w=window.open('','_blank','width=960,height=820');
+    if(!w){ toast('Pop-up blocked — allow pop-ups and try again.'); return; }
+    w.document.write(html);
+    w.document.close();
+  }catch(e){ toast('Could not open report: '+e.message); }
+}
+
 function registerPWA(){
   try{
     const icon='data:image/svg+xml,'+encodeURIComponent(
